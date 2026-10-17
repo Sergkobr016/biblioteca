@@ -1,5 +1,5 @@
 // Guarda la app para que abra sin conexión. Las búsquedas siempre van a internet.
-const CACHE = 'biblioteca-v2';
+const CACHE = 'biblioteca-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-180.png'];
 
 self.addEventListener('install', e => {
@@ -21,7 +21,7 @@ self.addEventListener('fetch', e => {
   // App: red primero, copia guardada si no hay conexión
   if (url.origin === location.origin) {
     e.respondWith(
-      fetch(req).then(res => {
+      fetch(req, { cache: 'no-store' }).then(res => {
         const copy = res.clone();
         caches.open(CACHE).then(c => c.put(req, copy));
         return res;

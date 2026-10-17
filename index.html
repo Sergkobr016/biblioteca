@@ -234,7 +234,7 @@ dialog[open]{display:flex;flex-direction:column}
     </div>
     <div id="scanWrap" hidden>
       <div id="scanner"></div>
-      <p class="note" style="text-align:center;margin:8px 0 0">Apunta al código de barras de la contraportada.</p>
+      <p class="note" id="scanHint" style="text-align:center;margin:8px 0 0">Apunta al código de barras de la contraportada.</p>
       <div class="btn-row" style="margin-top:8px"><button class="btn" id="btnStopScan">Cancelar escaneo</button></div>
     </div>
     <div class="results" id="results">
@@ -331,7 +331,10 @@ dialog[open]{display:flex;flex-direction:column}
     <div class="field"><label for="fGoal">Objetivo de libros este año</label><input id="fGoal" type="number" min="0" inputmode="numeric" placeholder="Por ejemplo, 24"></div>
     <div class="field"><label for="fApiKey">Clave de Google Books (opcional)</label><input id="fApiKey" autocomplete="off" placeholder="Solo si las búsquedas fallan a menudo"></div>
     <p class="note">Sin clave, Google limita las búsquedas y a veces no responde; entonces la app busca en Open Library. Con una clave gratuita de Google Cloud las búsquedas en Google funcionan siempre.</p>
+    <div class="btn-row"><button class="btn" id="btnTest">Probar la búsqueda</button></div>
+    <p class="note" id="testOut"></p>
     <p class="note" id="storageInfo"></p>
+    <p class="note">Versión 3 · 17-10-2026</p>
   </div>
 </dialog>
 
@@ -600,6 +603,7 @@ $('#btnAdd').addEventListener('click', () => {
     ? '<p class="warn">La app está abierta como archivo. Así no puede buscar libros ni usar la cámara. Ábrela desde tu enlace <b>https://…github.io/biblioteca/</b>.</p>'
     : '<p class="msg">Escribe el título, el autor o el ISBN y los resultados aparecen solos. La portada y la sinopsis se añaden al elegir el libro.</p>';
   $('#dlgAdd').showModal();
+  getDetector();
 });
 $('#dlgAdd').addEventListener('close', stopScan);
 $('#btnManual').addEventListener('click', () => {
@@ -613,15 +617,21 @@ $('#fTitle').addEventListener('input', () => {
   clearTimeout(suggestT);
   const v = $('#fTitle').value.trim();
   if (!isNew || v.length < 3) { $('#suggest').innerHTML = ''; return; }
+  $('#suggest').innerHTML = '<span class="src-tag">Buscando en internet…</span>';
   suggestT = setTimeout(async () => {
     const seq = ++suggestSeq;
     try {
       const list = await searchOnline(v);
       if (seq !== suggestSeq) return;
       suggestList = list;
-      $('#suggest').innerHTML = list.length ? `<span class="src-tag">¿Es alguno de estos? Tócalo para rellenar todo</span>${resultsHTML(list, 5)}` : '';
-    } catch { $('#suggest').innerHTML = ''; }
-  }, 600);
+      $('#suggest').innerHTML = list.length
+        ? `<span class="src-tag">¿Es alguno de estos? Tócalo para rellenar todo</span>${resultsHTML(list, 5)}`
+        : '<span class="src-tag">No he encontrado este título en internet. Puedes rellenarlo a mano.</span>';
+    } catch (e) {
+      if (seq !== suggestSeq) return;
+      $('#suggest').innerHTML = `<p class="warn">${errorHTML(e)}</p>`;
+    }
+  }, 500);
 });
 $('#suggest').addEventListener('click', async e => {
   const r = e.target.closest('.res'); if (!r) return;
@@ -635,16 +645,29 @@ $('#suggest').addEventListener('click', async e => {
 });
 
 /* ---------- Escáner de código de barras ---------- */
-let scanner = null, nativeScan = null;
-function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
-async function nativeDetector() {
-  if (!('BarcodeDetector' in window)) return null;
-  try {
-    const f = await BarcodeDetector.getSupportedFormats();
-    if (!f.includes('ean_13')) return null;
-    return new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a'] });
-  } catch { return null; }
+// Android/Chrome trae un lector propio. En iPhone se usa ZXing (WebAssembly), que lee bien los EAN-13 de los libros.
+const FORMATS = ['ean_13', 'ean_8', 'upc_a'];
+const POLYFILL_URLS = [
+  'https://cdn.jsdelivr.net/npm/barcode-detector@2/pure/+esm',
+  'https://cdn.jsdelivr.net/npm/barcode-detector@2/dist/es/pure.min.js',
+  'https://fastly.jsdelivr.net/npm/barcode-detector@2/dist/es/pure.min.js'
+];
+let detectorP = null;
+function getDetector() {
+  if (!detectorP) detectorP = (async () => {
+    if ('BarcodeDetector' in window) {
+      try { const f = await BarcodeDetector.getSupportedFormats(); if (f.includes('ean_13')) return new BarcodeDetector({ formats: FORMATS }); } catch {}
+    }
+    for (const u of POLYFILL_URLS) {
+      try { const m = await import(u); if (m.BarcodeDetector) return new m.BarcodeDetector({ formats: FORMATS }); } catch {}
+    }
+    return null;
+  })().then(d => { if (!d) detectorP = null; return d; });
+  return detectorP;
 }
+let scanner = null, liveScan = null;
+function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+const validCode = c => /^\d{8}$|^\d{12,13}$/.test(c);
 function onCode(code) {
   if (navigator.vibrate) navigator.vibrate(60);
   stopScan();
@@ -655,66 +678,92 @@ function cameraError(err) {
   stopScan();
   const n = err && err.name;
   if (!window.isSecureContext) toast('La cámara solo funciona abriendo la app desde su enlace https.');
-  else if (n === 'NotAllowedError' || n === 'SecurityError') toast('No hay permiso para la cámara. Actívalo en los ajustes del navegador para esta web.');
+  else if (n === 'NotAllowedError' || n === 'SecurityError') toast('No hay permiso para la cámara. En el iPhone: Ajustes › Safari › Cámara › Permitir.');
   else if (n === 'NotFoundError' || n === 'OverconstrainedError') toast('No se ha encontrado la cámara trasera.');
   else toast('No se ha podido abrir el escáner. Prueba con «Haz una foto del código de barras».');
 }
+function setScanHint(t) { $('#scanHint').textContent = t; }
 $('#btnScan').addEventListener('click', async () => {
   if (!window.isSecureContext || !navigator.mediaDevices) return cameraError({});
   $('#scanWrap').hidden = false;
   const box = $('#scanner'); box.innerHTML = '';
-  const det = await nativeDetector();
+  setScanHint('Preparando el lector…');
   try {
-    if (det) {
-      // Android/Chrome: lector nativo, más rápido y fiable
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-      const v = document.createElement('video'); v.setAttribute('playsinline', ''); v.muted = true; v.srcObject = stream;
-      box.append(v, Object.assign(document.createElement('div'), { className: 'aim' }));
-      await v.play();
-      nativeScan = { stream, alive: true };
-      const tick = async () => {
-        if (!nativeScan || !nativeScan.alive) return;
-        try { const r = await det.detect(v); if (r.length) return onCode(r[0].rawValue); } catch {}
-        setTimeout(tick, 180);
-      };
-      tick();
-    } else {
-      // iPhone y otros: librería html5-qrcode
-      if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
-      scanner = new Html5Qrcode('scanner', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false, experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
-      await scanner.start({ facingMode: 'environment' }, {
-        fps: 15,
-        qrbox: (w, h) => ({ width: Math.max(200, Math.floor(w * .9)), height: Math.max(80, Math.floor(Math.min(h * .45, 180))) }),
-        videoConstraints: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-      }, onCode, () => {});
-    }
-  } catch (err) { cameraError(err); }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    const track = stream.getVideoTracks()[0];
+    try { const c = track.getCapabilities ? track.getCapabilities() : {}; if (c.focusMode && c.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch {}
+    const v = document.createElement('video'); v.setAttribute('playsinline', ''); v.setAttribute('muted', ''); v.muted = true; v.autoplay = true; v.srcObject = stream;
+    box.append(v, Object.assign(document.createElement('div'), { className: 'aim' }));
+    await v.play();
+    liveScan = { stream, alive: true };
+    const det = await getDetector();
+    if (!liveScan) return;
+    if (!det) throw new Error('sin lector');
+    setScanHint('Pon el código de barras dentro del recuadro, a unos 15–20 cm, con buena luz.');
+    // Recorta la franja central del vídeo: menos píxeles = lectura más rápida en el iPhone
+    const cv = document.createElement('canvas'), ctx = cv.getContext('2d', { willReadFrequently: true });
+    let last = '', same = 0;
+    const tick = async () => {
+      if (!liveScan || !liveScan.alive) return;
+      try {
+        if (v.videoWidth) {
+          const w = v.videoWidth, h = v.videoHeight, ch = Math.round(h * 0.5);
+          cv.width = w; cv.height = ch;
+          ctx.drawImage(v, 0, Math.round((h - ch) / 2), w, ch, 0, 0, w, ch);
+          const r = await det.detect(cv);
+          const code = r.map(x => x.rawValue).find(validCode);
+          // Exige dos lecturas iguales seguidas para evitar errores
+          if (code) { if (code === last) same++; else { last = code; same = 1; } if (same >= 2 || /^97[89]/.test(code)) return onCode(code); }
+        }
+      } catch {}
+      setTimeout(tick, 120);
+    };
+    tick();
+  } catch (err) {
+    if (liveScan || (err && err.message === 'sin lector')) {
+      // Último recurso: html5-qrcode
+      stopScan(); $('#scanWrap').hidden = false; $('#scanner').innerHTML = '';
+      try {
+        if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
+        setScanHint('Pon el código de barras dentro del recuadro.');
+        scanner = new Html5Qrcode('scanner', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false });
+        await scanner.start({ facingMode: 'environment' }, { fps: 15, qrbox: (w, h) => ({ width: Math.floor(w * .9), height: Math.floor(Math.min(h * .45, 180)) }) }, c => validCode(c) && onCode(c), () => {});
+      } catch (e2) { cameraError(e2); }
+    } else cameraError(err);
+  }
 });
 function stopScan() {
   $('#scanWrap').hidden = true;
-  if (nativeScan) { nativeScan.alive = false; nativeScan.stream.getTracks().forEach(t => t.stop()); nativeScan = null; $('#scanner').innerHTML = ''; }
+  if (liveScan) { liveScan.alive = false; liveScan.stream.getTracks().forEach(t => t.stop()); liveScan = null; $('#scanner').innerHTML = ''; }
   if (scanner) { const s = scanner; scanner = null; s.stop().then(() => s.clear()).catch(() => {}); }
 }
 $('#btnStopScan').addEventListener('click', stopScan);
 
-/* Foto del código de barras (plan B, funciona en cualquier móvil) */
+/* Foto del código de barras (funciona en cualquier móvil) */
+async function decodePhoto(file) {
+  const det = await getDetector();
+  if (!det) return '';
+  const bmp = await createImageBitmap(file);
+  // Prueba a varios tamaños y también girada, por si la foto está de lado
+  for (const max of [1600, 2400, 1000]) {
+    for (const rot of [0, 90]) {
+      const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+      const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
+      const c = document.createElement('canvas'); const x = c.getContext('2d');
+      if (rot) { c.width = h; c.height = w; x.translate(h, 0); x.rotate(Math.PI / 2); } else { c.width = w; c.height = h; }
+      x.drawImage(bmp, 0, 0, w, h);
+      try { const r = await det.detect(c); const code = r.map(z => z.rawValue).find(validCode); if (code) return code; } catch {}
+    }
+  }
+  return '';
+}
 $('#fBarcodePhoto').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-  $('#results').innerHTML = '<div class="spinner" role="status" aria-label="Leyendo código"></div>';
+  $('#results').innerHTML = '<div class="spinner" role="status" aria-label="Leyendo código"></div><p class="msg">Leyendo el código…</p>';
   let code = '';
-  try {
-    const det = await nativeDetector();
-    if (det) { const r = await det.detect(await createImageBitmap(f)); if (r.length) code = r[0].rawValue; }
-    if (!code) {
-      if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
-      let tmp = document.getElementById('scanTmp');
-      if (!tmp) { tmp = Object.assign(document.createElement('div'), { id: 'scanTmp', hidden: true }); document.body.append(tmp); }
-      const h = new Html5Qrcode('scanTmp', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false });
-      code = await h.scanFile(f, false).catch(() => '');
-    }
-  } catch {}
+  try { code = await decodePhoto(f); } catch {}
   if (code) onCode(code);
-  else $('#results').innerHTML = '<p class="msg">No he podido leer el código en la foto. Hazla más de cerca, recta y con buena luz, o escribe los números del ISBN que hay debajo del código.</p>';
+  else $('#results').innerHTML = '<p class="msg">No he podido leer el código en la foto. Hazla más de cerca, recta y con buena luz, o escribe en el buscador los números que hay debajo del código.</p>';
 });
 
 /* ---------- Ficha del libro ---------- */
@@ -828,6 +877,16 @@ $('#btnSettings').addEventListener('click', async () => {
   } catch { $('#storageInfo').textContent = `${books.length} libros guardados`; }
   $('#dlgSettings').showModal();
 });
+$('#btnTest').addEventListener('click', async () => {
+  const out = $('#testOut'); out.textContent = 'Probando…';
+  const lines = [];
+  const t = async (name, fn) => { try { const n = (await fn()).length; lines.push(`${name}: funciona (${n} resultados)`); } catch (e) { lines.push(`${name}: no responde (${e.message})`); } };
+  await t('Google Books', () => searchGoogle('Cien años de soledad', ''));
+  await t('Open Library', () => searchOpenLibrary('Cien años de soledad', ''));
+  const det = await getDetector();
+  lines.push('Lector de códigos: ' + (det ? 'listo' : 'no se ha podido cargar'));
+  out.innerHTML = lines.map(esc).join('<br>');
+});
 $('#fApiKey').addEventListener('change', async () => { settings.apiKey = $('#fApiKey').value.trim(); await store.set('settings', settings); toast('Clave guardada'); });
 $('#fGoal').addEventListener('change', async () => { settings.goal = Math.max(0, parseInt($('#fGoal').value) || 0); await store.set('settings', settings); renderStats(); });
 $('#btnExport').addEventListener('click', async () => {
@@ -865,7 +924,12 @@ $('#fImport').addEventListener('change', async e => {
   renderAll();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 })();
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => r.update()).catch(() => {});
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
+}
 </script>
 </body>
 </html>
