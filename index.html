@@ -269,6 +269,7 @@ dialog[open]{display:flex;flex-direction:column}
       <div class="desc clamp" id="bDesc"></div>
       <button type="button" class="more" id="btnMore" hidden>Leer más</button>
       <span class="src" id="bSrc"></span>
+      <button type="button" class="btn brass" id="btnFill" hidden style="align-self:flex-start">Buscar sinopsis y género</button>
     </div>
 
     <div class="field">
@@ -302,7 +303,6 @@ dialog[open]{display:flex;flex-direction:column}
         <label class="btn" for="fPhoto"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Usar mi foto</label>
         <input type="file" id="fPhoto" accept="image/*" capture="environment" hidden>
         <button type="button" class="btn ghost" id="btnEditBasics">Editar datos del libro</button>
-        <button type="button" class="btn" id="btnFill" hidden>Buscar sinopsis y género</button>
       </div>
     </div>
 
@@ -335,7 +335,7 @@ dialog[open]{display:flex;flex-direction:column}
     <div class="btn-row"><button class="btn" id="btnTest">Probar la búsqueda</button></div>
     <p class="note" id="testOut"></p>
     <p class="note" id="storageInfo"></p>
-    <p class="note">Versión 4 · 17-10-2026</p>
+    <p class="note">Versión 5 · 17-10-2026</p>
   </div>
 </dialog>
 
@@ -480,12 +480,38 @@ const isbnOf = q => { const c = q.replace(/[-\s]/g, ''); return /^(97[89])?\d{9}
 const OL = 'https://openlibrary.org';
 const olCover = (id) => id ? `https://covers.openlibrary.org/b/id/${id}-L.jpg` : '';
 
-async function searchGoogle(q, isbn) {
+async function googleQuery(q, extra = '') {
   const key = settings.apiKey ? `&key=${encodeURIComponent(settings.apiKey)}` : '';
-  const r = await fetch(`${GB}?q=${encodeURIComponent(isbn ? 'isbn:' + isbn : q)}&maxResults=20&printType=books${key}`);
+  const r = await fetch(`${GB}?q=${encodeURIComponent(q)}&maxResults=20&printType=books${extra}${key}`);
   if (!r.ok) throw new Error('google ' + r.status);
   const j = await r.json();
   return (j.items || []).map(fromGoogle).filter(x => x.title && !x.title.startsWith('undefined'));
+}
+async function searchGoogle(q, isbn) {
+  if (isbn) return googleQuery('isbn:' + isbn);
+  // Dos búsquedas a la vez: ediciones en español primero, luego el resto
+  const [es, all] = await Promise.allSettled([googleQuery(q, '&langRestrict=es'), googleQuery(q)]);
+  if (es.status === 'rejected' && all.status === 'rejected') throw all.reason;
+  const seen = new Set(), out = [];
+  for (const x of [...(es.value || []), ...(all.value || [])]) if (!seen.has(x.gid)) { seen.add(x.gid); out.push(x); }
+  return out;
+}
+/* ¿Está este texto en español? Cuenta palabras típicas de cada idioma */
+const ES_WORDS = new Set('y los del las por con una para el su sus como pero más fue este esta entre cuando muy sin sobre también hasta donde desde novela historia vida años sus le lo al se'.split(' '));
+const EN_WORDS = new Set('the and of to is that it was for on with as his her by at from this be are an which have has they not but their who'.split(' '));
+function isSpanish(t) {
+  if (!t) return false;
+  let es = 0, en = 0;
+  for (const w of norm(t).match(/[a-zñ]+/g) || []) { if (ES_WORDS.has(w)) es++; else if (EN_WORDS.has(w)) en++; }
+  return es >= 4 && es > en * 2;
+}
+/* Busca una edición en español del mismo libro para sacar su sinopsis */
+async function spanishGoogleDesc(b) {
+  const main = b.title.split(/[:(.]/)[0].trim();
+  const surname = (b.authors || '').split(',')[0].trim().split(' ').pop();
+  const list = await googleQuery(`intitle:${main}` + (surname ? ` inauthor:${surname}` : ''), '&langRestrict=es');
+  const hit = list.find(x => isSpanish(x.description));
+  return hit ? hit.description : '';
 }
 async function searchOpenLibrary(q, isbn) {
   if (isbn) { const one = await openLibraryISBN(isbn); return one ? [one] : []; }
@@ -583,7 +609,15 @@ async function wikidataGenre(qid) {
 }
 
 async function enrich(b) {
-  const tasks = [];
+  // Preferimos la sinopsis en español; si no hay ninguna, se usa la de otro idioma
+  let other = null;
+  const keepOther = (d, src) => { if (d && (!other || d.length > other.d.length)) other = { d, src }; };
+  if (b.description && !isSpanish(b.description)) { keepOther(b.description, b.descSource || b.source); b.description = ''; }
+  const takeDesc = (d, src) => {
+    if (!d) return;
+    if (!isSpanish(d)) return keepOther(d, src);
+    if (!b.description || d.length > b.description.length) { b.description = d; b.descSource = src; }
+  };
   // 1. Ficha completa de Google: portada grande, sinopsis, categoría
   if (b.gid) {
     try {
@@ -591,27 +625,30 @@ async function enrich(b) {
       const r = await fetch(`${GB}/${b.gid}${key}`);
       if (r.ok) {
         const full = fromGoogle(await r.json());
-        for (const k of ['cover', 'description', 'pages', 'publisher', 'genre']) if (full[k] && (!b[k] || (k === 'description' && full[k].length > b[k].length))) b[k] = full[k];
+        for (const k of ['cover', 'pages', 'publisher', 'genre']) if (full[k] && !b[k]) b[k] = full[k];
+        takeDesc(full.description, 'Google Books');
       }
     } catch {}
-  } else if (b.isbn && settings.apiKey) {
-    try { const g = await searchGoogle('', b.isbn); if (g[0]) { for (const k of ['description', 'cover', 'genre', 'gid']) if (!b[k] && g[0][k]) b[k] = g[0][k]; } } catch {}
+  } else if (b.isbn) {
+    try { const g = await searchGoogle('', b.isbn); if (g[0]) { for (const k of ['cover', 'genre', 'gid']) if (!b[k] && g[0][k]) b[k] = g[0][k]; takeDesc(g[0].description, 'Google Books'); } } catch {}
   }
-  // 2. Wikipedia en español: sinopsis si falta, y género desde Wikidata
+  // 2. Si la edición no es española, busca la sinopsis de una edición en español
+  if (!b.description) { try { takeDesc(await spanishGoogleDesc(b), 'Google Books'); } catch {} }
+  // 3. Wikipedia en español: sinopsis si falta, y género desde Wikidata
   let wp = null;
   try { wp = await wikipediaBook(b); } catch {}
   if (wp) {
     if (!b.description || b.description.length < 120) { b.description = wp.description; b.descSource = 'Wikipedia'; }
     if (wp.wikidata) { try { const g = await wikidataGenre(wp.wikidata); if (g) { b.genre = g; b.genreES = true; } } catch {} }
   }
-  // 3. Open Library: sinopsis (a menudo en inglés) y temas
+  // 4. Open Library: género y, si hace falta, sinopsis
   if (b.olkey && (!b.description || !b.genre)) {
     try {
       const r = await fetch(`${OL}${b.olkey}.json`);
       if (r.ok) {
         const w = await r.json();
         const d = typeof w.description === 'string' ? w.description : (w.description && w.description.value) || '';
-        if (!b.description && d) { b.description = d.replace(/\r/g, '').replace(/\(\[source\].*$/s, '').trim(); b.descSource = 'Open Library'; }
+        takeDesc(d.replace(/\r/g, '').replace(/\(\[source\].*$/s, '').trim(), 'Open Library');
         if (!b.genre && w.subjects) b.genre = genreES(w.subjects);
       }
     } catch {}
@@ -621,6 +658,7 @@ async function enrich(b) {
     b.genre = genreES(b.genre) || b.genre;
   }
   if (!b.cover && b.isbn) b.cover = `https://covers.openlibrary.org/b/isbn/${b.isbn}-L.jpg?default=false`;
+  if (!b.description && other) { b.description = other.d; b.descSource = other.src; }
   delete b.genreES;
   return b;
 }
@@ -868,7 +906,8 @@ function paintView(b) {
   d.classList.add('clamp');
   requestAnimationFrame(() => { $('#btnMore').hidden = d.scrollHeight <= d.clientHeight + 2; });
   $('#bSrc').textContent = [b.source ? 'Datos de ' + b.source : '', b.descSource && b.descSource !== b.source ? 'sinopsis de ' + b.descSource : ''].filter(Boolean).join(' · ');
-  $('#btnFill').hidden = isNew || (!!b.description && !!b.genre);
+  $('#btnFill').hidden = isNew || (isSpanish(b.description) && !!b.genre);
+  $('#btnFill').textContent = b.description && !isSpanish(b.description) ? 'Buscar sinopsis en español' : 'Buscar sinopsis y género';
 }
 function openBook(b, newBook = false, manual = false) {
   editing = b; isNew = newBook; pendingPhoto = null; $('#suggest').innerHTML = '';
@@ -897,13 +936,13 @@ $('#btnFill').addEventListener('click', async () => {
   const btn = $('#btnFill'); btn.disabled = true; btn.textContent = 'Buscando…';
   const b = { ...editing };
   await enrich(b);
-  btn.disabled = false; btn.textContent = 'Buscar sinopsis y género';
+  btn.disabled = false;
   let got = [];
-  if (b.description && !editing.description) { editing.description = b.description; editing.descSource = b.descSource; $('#fDesc').value = b.description; got.push('sinopsis'); }
+  if (b.description && (!editing.description || (!isSpanish(editing.description) && isSpanish(b.description)))) { editing.description = b.description; editing.descSource = b.descSource; $('#fDesc').value = b.description; got.push('sinopsis'); }
   if (b.genre && !editing.genre) { editing.genre = b.genre; $('#fGenre').value = b.genre; got.push('género'); }
   if (b.cover && !editing.cover) editing.cover = b.cover;
   if (got.length) { await save(); paintView(editing); renderShelf(); toast('Añadido: ' + got.join(' y ')); }
-  else toast('No he encontrado más datos de este libro. Puedes escribirlos con «Editar datos del libro».');
+  else toast(editing.description && !isSpanish(editing.description) ? 'No hay sinopsis en español; se queda la que tenía.' : 'No he encontrado más datos de este libro. Puedes escribirlos con «Editar datos del libro».');
 });
 $('#btnEditBasics').addEventListener('click', () => { $('#editBasics').hidden = false; $('#descBlock').hidden = true; $('#fTitle').focus(); });
 
