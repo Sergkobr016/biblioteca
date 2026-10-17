@@ -163,6 +163,10 @@ dialog[open]{display:flex;flex-direction:column}
 
 .toast{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom) + 90px);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:.92rem;box-shadow:var(--shadow);max-width:calc(100% - 32px)}
 .note{font-size:.85rem;color:var(--muted);line-height:1.5}
+.warn{background:var(--brass-soft);border-radius:10px;padding:10px 12px;font-size:.9rem;line-height:1.45}
+#scanner{position:relative}
+#scanner .aim{position:absolute;left:10%;right:10%;top:35%;bottom:35%;border:2px solid var(--brass);border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.35);pointer-events:none}
+.src-tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -224,6 +228,10 @@ dialog[open]{display:flex;flex-direction:column}
       <button class="btn brass" id="btnScan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 8v8M10 8v8M13 8v8M17 8v8"/></svg>Escanear código de barras</button>
       <button class="btn" id="btnManual">Añadir a mano</button>
     </div>
+    <div class="btn-row">
+      <label class="btn ghost" for="fBarcodePhoto" style="flex:1 1 100%">¿No lo lee? Haz una foto del código de barras</label>
+      <input type="file" id="fBarcodePhoto" accept="image/*" capture="environment" hidden>
+    </div>
     <div id="scanWrap" hidden>
       <div id="scanner"></div>
       <p class="note" style="text-align:center;margin:8px 0 0">Apunta al código de barras de la contraportada.</p>
@@ -249,7 +257,7 @@ dialog[open]{display:flex;flex-direction:column}
     </div>
 
     <div id="editBasics" class="grid2" hidden>
-      <div class="field" style="grid-column:1/-1"><label for="fTitle">Título</label><input id="fTitle" required></div>
+      <div class="field" style="grid-column:1/-1"><label for="fTitle">Título</label><input id="fTitle" required autocomplete="off"><div class="results" id="suggest"></div></div>
       <div class="field" style="grid-column:1/-1"><label for="fAuthor">Autor</label><input id="fAuthor"></div>
       <div class="field"><label for="fYear">Año</label><input id="fYear" inputmode="numeric"></div>
       <div class="field"><label for="fPages">Páginas</label><input id="fPages" inputmode="numeric"></div>
@@ -321,6 +329,8 @@ dialog[open]{display:flex;flex-direction:column}
       <input type="file" id="fImport" accept="application/json,.json" hidden>
     </div>
     <div class="field"><label for="fGoal">Objetivo de libros este año</label><input id="fGoal" type="number" min="0" inputmode="numeric" placeholder="Por ejemplo, 24"></div>
+    <div class="field"><label for="fApiKey">Clave de Google Books (opcional)</label><input id="fApiKey" autocomplete="off" placeholder="Solo si las búsquedas fallan a menudo"></div>
+    <p class="note">Sin clave, Google limita las búsquedas y a veces no responde; entonces la app busca en Open Library. Con una clave gratuita de Google Cloud las búsquedas en Google funcionan siempre.</p>
     <p class="note" id="storageInfo"></p>
   </div>
 </dialog>
@@ -462,26 +472,49 @@ function fromGoogle(v) {
     publisher: i.publisher || '', genre: (i.categories || [])[0] || '', lang: i.language || '', source: 'Google Books'
   };
 }
-async function searchOnline(q) {
-  const clean = q.replace(/[-\s]/g, '');
-  const isISBN = /^(97[89])?\d{9}[\dXx]$/.test(clean);
-  const url = `${GB}?q=${encodeURIComponent(isISBN ? 'isbn:' + clean : q)}&maxResults=20&printType=books`;
-  const r = await fetch(url);
-  if (r.status === 429) throw new Error('limite');
-  if (!r.ok) throw new Error('red');
+const isbnOf = q => { const c = q.replace(/[-\s]/g, ''); return /^(97[89])?\d{9}[\dXx]$/.test(c) ? c : ''; };
+const OL = 'https://openlibrary.org';
+const olCover = (id) => id ? `https://covers.openlibrary.org/b/id/${id}-L.jpg` : '';
+
+async function searchGoogle(q, isbn) {
+  const key = settings.apiKey ? `&key=${encodeURIComponent(settings.apiKey)}` : '';
+  const r = await fetch(`${GB}?q=${encodeURIComponent(isbn ? 'isbn:' + isbn : q)}&maxResults=20&printType=books${key}`);
+  if (!r.ok) throw new Error('google ' + r.status);
   const j = await r.json();
-  let items = (j.items || []).map(fromGoogle).filter(x => x.title && x.title !== 'undefined');
-  if (!items.length && isISBN) {
-    const ol = await openLibraryISBN(clean);
-    if (ol) items = [ol];
+  return (j.items || []).map(fromGoogle).filter(x => x.title && !x.title.startsWith('undefined'));
+}
+async function searchOpenLibrary(q, isbn) {
+  if (isbn) { const one = await openLibraryISBN(isbn); return one ? [one] : []; }
+  const fields = 'key,title,subtitle,author_name,first_publish_year,isbn,cover_i,number_of_pages_median,publisher,subject';
+  const r = await fetch(`${OL}/search.json?q=${encodeURIComponent(q)}&limit=20&lang=es&fields=${fields}`);
+  if (!r.ok) throw new Error('openlibrary ' + r.status);
+  const j = await r.json();
+  return (j.docs || []).map(d => {
+    const isbns = d.isbn || [];
+    return {
+      olkey: d.key, title: d.title + (d.subtitle ? ': ' + d.subtitle : ''), authors: (d.author_name || []).slice(0, 3).join(', '),
+      cover: olCover(d.cover_i), description: '', isbn: isbns.find(x => /^97[89]84/.test(x)) || isbns.find(x => x.length === 13) || isbns[0] || '',
+      pages: d.number_of_pages_median || '', year: d.first_publish_year || '', publisher: (d.publisher || [])[0] || '',
+      genre: '', source: 'Open Library'
+    };
+  });
+}
+async function searchOnline(q) {
+  const isbn = isbnOf(q);
+  let items = [], errors = [];
+  try { items = await searchGoogle(q, isbn); } catch (e) { errors.push(e.message); }
+  if (!items.length) {
+    try { items = await searchOpenLibrary(q, isbn); } catch (e) { errors.push(e.message); }
   }
+  if (!items.length && errors.length === 2) throw new Error(errors.join(' · '));
   return items;
 }
 async function openLibraryISBN(isbn) {
   try {
-    const r = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
+    const r = await fetch(`${OL}/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
     const j = await r.json(); const d = j['ISBN:' + isbn]; if (!d) return null;
     return {
+      olkey: (d.works && d.works[0] && d.works[0].key) || '',
       title: d.title, authors: (d.authors || []).map(a => a.name).join(', '),
       cover: (d.cover && (d.cover.large || d.cover.medium)) || '', description: '', isbn,
       pages: d.number_of_pages || '', year: (d.publish_date || '').match(/\d{4}/)?.[0] || '',
@@ -490,37 +523,67 @@ async function openLibraryISBN(isbn) {
   } catch { return null; }
 }
 async function enrich(b) {
-  // La ficha completa de Google trae portada más grande y la sinopsis entera
+  // Ficha completa: portada más grande y sinopsis entera
   if (b.gid) {
     try {
-      const r = await fetch(`${GB}/${b.gid}`);
+      const key = settings.apiKey ? `?key=${encodeURIComponent(settings.apiKey)}` : '';
+      const r = await fetch(`${GB}/${b.gid}${key}`);
       if (r.ok) {
         const full = fromGoogle(await r.json());
         for (const k of ['cover', 'description', 'pages', 'publisher', 'genre']) if (full[k] && (!b[k] || (k === 'description' && full[k].length > b[k].length))) b[k] = full[k];
       }
     } catch {}
   }
+  if (!b.description && b.olkey) {
+    try {
+      const r = await fetch(`${OL}${b.olkey}.json`);
+      if (r.ok) { const w = await r.json(); const d = typeof w.description === 'string' ? w.description : (w.description && w.description.value) || ''; b.description = d.replace(/\r/g, '').trim(); if (!b.genre && w.subjects) b.genre = w.subjects[0]; }
+    } catch {}
+  }
+  if (!b.description && b.isbn && !b.gid) {
+    // Último intento: sinopsis en Google por ISBN
+    try { const g = await searchGoogle('', b.isbn); if (g[0]) { b.description = g[0].description; if (!b.cover) b.cover = g[0].cover; b.gid = g[0].gid; } } catch {}
+  }
   if (!b.cover && b.isbn) b.cover = `https://covers.openlibrary.org/b/isbn/${b.isbn}-L.jpg?default=false`;
   return b;
 }
 
-let lastResults = [];
+function resultsHTML(list, max = 20) {
+  return list.slice(0, max).map((b, i) => {
+    const owned = books.some(x => (b.isbn && x.isbn === b.isbn) || (b.gid && x.gid === b.gid));
+    return `<button type="button" class="res" data-i="${i}"><div class="cover">${coverHTML(b)}</div><div class="res-info"><b>${esc(b.title)}</b><span>${esc(b.authors || 'Autor desconocido')}</span><span>${esc([b.year, b.publisher].filter(Boolean).join(' · '))}</span>${owned ? '<span class="owned">Ya está en tu biblioteca</span>' : ''}</div></button>`;
+  }).join('');
+}
+function errorHTML(e) {
+  if (!navigator.onLine) return 'No hay conexión a internet. Conéctate y vuelve a intentarlo.';
+  if (location.protocol !== 'https:' && location.protocol !== 'http:') return 'La app está abierta como archivo y así no puede buscar. Ábrela desde tu enlace https://…github.io/biblioteca/.';
+  return `No ha respondido ni Google Books ni Open Library. Espera un momento y vuelve a intentarlo.<br><small>(${esc(e.message)})</small>`;
+}
+
+let lastResults = [], searchSeq = 0;
 async function doSearch(q) {
   q = q.trim(); if (!q) return;
+  const seq = ++searchSeq;
   const box = $('#results');
   box.innerHTML = '<div class="spinner" role="status" aria-label="Buscando"></div>';
   try {
-    lastResults = await searchOnline(q);
-    if (!lastResults.length) { box.innerHTML = `<p class="msg">No he encontrado nada con «${esc(q)}». Prueba con otras palabras o añádelo a mano.</p>`; return; }
-    box.innerHTML = lastResults.map((b, i) => {
-      const owned = books.some(x => (b.isbn && x.isbn === b.isbn) || (b.gid && x.gid === b.gid));
-      return `<button class="res" data-i="${i}"><div class="cover">${coverHTML(b)}</div><div class="res-info"><b>${esc(b.title)}</b><span>${esc(b.authors || 'Autor desconocido')}</span><span>${esc([b.year, b.publisher].filter(Boolean).join(' · '))}</span>${owned ? '<span class="owned">Ya está en tu biblioteca</span>' : ''}</div></button>`;
-    }).join('');
+    const list = await searchOnline(q);
+    if (seq !== searchSeq) return;
+    lastResults = list;
+    if (!list.length) { box.innerHTML = `<p class="msg">No he encontrado nada con «${esc(q)}». Prueba con otras palabras o añádelo a mano.</p>`; return; }
+    box.innerHTML = `<span class="src-tag">Resultados de ${esc(list[0].source)}</span>` + resultsHTML(list);
   } catch (e) {
-    box.innerHTML = `<p class="msg">${e.message === 'limite' ? 'Google Books ha recibido demasiadas búsquedas. Espera un minuto y vuelve a intentarlo.' : 'No se ha podido conectar. Revisa la conexión a internet y vuelve a intentarlo.'}</p>`;
+    if (seq !== searchSeq) return;
+    box.innerHTML = `<p class="msg">${errorHTML(e)}</p>`;
   }
 }
-$('#formSearch').addEventListener('submit', e => { e.preventDefault(); $('#qOnline').blur(); doSearch($('#qOnline').value); });
+let typeT;
+$('#qOnline').addEventListener('input', () => {
+  clearTimeout(typeT);
+  const v = $('#qOnline').value.trim();
+  if (v.length >= 3) typeT = setTimeout(() => doSearch(v), 550);
+});
+$('#formSearch').addEventListener('submit', e => { e.preventDefault(); clearTimeout(typeT); $('#qOnline').blur(); doSearch($('#qOnline').value); });
 $('#results').addEventListener('click', async e => {
   const r = e.target.closest('.res'); if (!r) return;
   const b = { ...lastResults[+r.dataset.i] };
@@ -532,7 +595,10 @@ $('#results').addEventListener('click', async e => {
 });
 $('#btnAdd').addEventListener('click', () => {
   $('#qOnline').value = '';
-  $('#results').innerHTML = '<p class="msg">Busca por título, autor o ISBN. La portada y la sinopsis se añaden solas desde Google Books.</p>';
+  const fileMode = location.protocol !== 'https:' && location.protocol !== 'http:';
+  $('#results').innerHTML = fileMode
+    ? '<p class="warn">La app está abierta como archivo. Así no puede buscar libros ni usar la cámara. Ábrela desde tu enlace <b>https://…github.io/biblioteca/</b>.</p>'
+    : '<p class="msg">Escribe el título, el autor o el ISBN y los resultados aparecen solos. La portada y la sinopsis se añaden al elegir el libro.</p>';
   $('#dlgAdd').showModal();
 });
 $('#dlgAdd').addEventListener('close', stopScan);
@@ -541,30 +607,115 @@ $('#btnManual').addEventListener('click', () => {
   openBook({ title: $('#qOnline').value.trim(), authors: '', description: '', source: '' }, true, true);
 });
 
+/* Sugerencias al escribir el título a mano */
+let suggestList = [], suggestT, suggestSeq = 0;
+$('#fTitle').addEventListener('input', () => {
+  clearTimeout(suggestT);
+  const v = $('#fTitle').value.trim();
+  if (!isNew || v.length < 3) { $('#suggest').innerHTML = ''; return; }
+  suggestT = setTimeout(async () => {
+    const seq = ++suggestSeq;
+    try {
+      const list = await searchOnline(v);
+      if (seq !== suggestSeq) return;
+      suggestList = list;
+      $('#suggest').innerHTML = list.length ? `<span class="src-tag">¿Es alguno de estos? Tócalo para rellenar todo</span>${resultsHTML(list, 5)}` : '';
+    } catch { $('#suggest').innerHTML = ''; }
+  }, 600);
+});
+$('#suggest').addEventListener('click', async e => {
+  const r = e.target.closest('.res'); if (!r) return;
+  const b = { ...suggestList[+r.dataset.i] };
+  r.style.opacity = .5;
+  await enrich(b);
+  $('#suggest').innerHTML = '';
+  const keep = { status: curStatus, rating: curRating, finished: $('#fFinished').value, notes: $('#fNotes').value.trim() };
+  $('#dlgBook').close();
+  openBook({ ...b, ...keep }, true);
+});
+
 /* ---------- Escáner de código de barras ---------- */
-let scanner = null;
+let scanner = null, nativeScan = null;
 function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
-$('#btnScan').addEventListener('click', async () => {
-  $('#scanWrap').hidden = false;
+async function nativeDetector() {
+  if (!('BarcodeDetector' in window)) return null;
   try {
-    if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
-    scanner = new Html5Qrcode('scanner', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false });
-    await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: (w, h) => ({ width: Math.min(300, w * .85), height: Math.min(130, h * .4) }) }, code => {
-      if (navigator.vibrate) navigator.vibrate(60);
-      stopScan();
-      $('#qOnline').value = code;
-      doSearch(code);
-    }, () => {});
-  } catch (err) {
-    stopScan();
-    toast('No se ha podido abrir la cámara. Da permiso a la cámara o escribe el ISBN.');
-  }
+    const f = await BarcodeDetector.getSupportedFormats();
+    if (!f.includes('ean_13')) return null;
+    return new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a'] });
+  } catch { return null; }
+}
+function onCode(code) {
+  if (navigator.vibrate) navigator.vibrate(60);
+  stopScan();
+  $('#qOnline').value = code;
+  doSearch(code);
+}
+function cameraError(err) {
+  stopScan();
+  const n = err && err.name;
+  if (!window.isSecureContext) toast('La cámara solo funciona abriendo la app desde su enlace https.');
+  else if (n === 'NotAllowedError' || n === 'SecurityError') toast('No hay permiso para la cámara. Actívalo en los ajustes del navegador para esta web.');
+  else if (n === 'NotFoundError' || n === 'OverconstrainedError') toast('No se ha encontrado la cámara trasera.');
+  else toast('No se ha podido abrir el escáner. Prueba con «Haz una foto del código de barras».');
+}
+$('#btnScan').addEventListener('click', async () => {
+  if (!window.isSecureContext || !navigator.mediaDevices) return cameraError({});
+  $('#scanWrap').hidden = false;
+  const box = $('#scanner'); box.innerHTML = '';
+  const det = await nativeDetector();
+  try {
+    if (det) {
+      // Android/Chrome: lector nativo, más rápido y fiable
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      const v = document.createElement('video'); v.setAttribute('playsinline', ''); v.muted = true; v.srcObject = stream;
+      box.append(v, Object.assign(document.createElement('div'), { className: 'aim' }));
+      await v.play();
+      nativeScan = { stream, alive: true };
+      const tick = async () => {
+        if (!nativeScan || !nativeScan.alive) return;
+        try { const r = await det.detect(v); if (r.length) return onCode(r[0].rawValue); } catch {}
+        setTimeout(tick, 180);
+      };
+      tick();
+    } else {
+      // iPhone y otros: librería html5-qrcode
+      if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
+      scanner = new Html5Qrcode('scanner', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false, experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
+      await scanner.start({ facingMode: 'environment' }, {
+        fps: 15,
+        qrbox: (w, h) => ({ width: Math.max(200, Math.floor(w * .9)), height: Math.max(80, Math.floor(Math.min(h * .45, 180))) }),
+        videoConstraints: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+      }, onCode, () => {});
+    }
+  } catch (err) { cameraError(err); }
 });
 function stopScan() {
   $('#scanWrap').hidden = true;
+  if (nativeScan) { nativeScan.alive = false; nativeScan.stream.getTracks().forEach(t => t.stop()); nativeScan = null; $('#scanner').innerHTML = ''; }
   if (scanner) { const s = scanner; scanner = null; s.stop().then(() => s.clear()).catch(() => {}); }
 }
 $('#btnStopScan').addEventListener('click', stopScan);
+
+/* Foto del código de barras (plan B, funciona en cualquier móvil) */
+$('#fBarcodePhoto').addEventListener('change', async e => {
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  $('#results').innerHTML = '<div class="spinner" role="status" aria-label="Leyendo código"></div>';
+  let code = '';
+  try {
+    const det = await nativeDetector();
+    if (det) { const r = await det.detect(await createImageBitmap(f)); if (r.length) code = r[0].rawValue; }
+    if (!code) {
+      if (!window.Html5Qrcode) await loadScript('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
+      let tmp = document.getElementById('scanTmp');
+      if (!tmp) { tmp = Object.assign(document.createElement('div'), { id: 'scanTmp', hidden: true }); document.body.append(tmp); }
+      const h = new Html5Qrcode('scanTmp', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.UPC_A], verbose: false });
+      code = await h.scanFile(f, false).catch(() => '');
+    }
+  } catch {}
+  if (code) onCode(code);
+  else $('#results').innerHTML = '<p class="msg">No he podido leer el código en la foto. Hazla más de cerca, recta y con buena luz, o escribe los números del ISBN que hay debajo del código.</p>';
+});
 
 /* ---------- Ficha del libro ---------- */
 let editing = null, isNew = false, curStatus = 'pendiente', curRating = 0, pendingPhoto = null;
@@ -596,7 +747,7 @@ function paintView(b) {
   $('#bSrc').textContent = b.source ? 'Datos de ' + b.source : '';
 }
 function openBook(b, newBook = false, manual = false) {
-  editing = b; isNew = newBook; pendingPhoto = null;
+  editing = b; isNew = newBook; pendingPhoto = null; $('#suggest').innerHTML = '';
   $('#bookHeading').textContent = newBook ? 'Nuevo libro' : 'Mi libro';
   paintView(b);
   $('#fTitle').value = b.title || ''; $('#fAuthor').value = b.authors || '';
@@ -670,16 +821,17 @@ $('#btnDelYes').addEventListener('click', async () => {
 
 /* ---------- Copia de seguridad ---------- */
 $('#btnSettings').addEventListener('click', async () => {
-  $('#fGoal').value = settings.goal || '';
+  $('#fGoal').value = settings.goal || ''; $('#fApiKey').value = settings.apiKey || '';
   try {
     const est = navigator.storage && await navigator.storage.estimate();
     $('#storageInfo').textContent = `${books.length} libros guardados` + (est ? ` · ${(est.usage / 1048576).toFixed(1)} MB usados` : '');
   } catch { $('#storageInfo').textContent = `${books.length} libros guardados`; }
   $('#dlgSettings').showModal();
 });
+$('#fApiKey').addEventListener('change', async () => { settings.apiKey = $('#fApiKey').value.trim(); await store.set('settings', settings); toast('Clave guardada'); });
 $('#fGoal').addEventListener('change', async () => { settings.goal = Math.max(0, parseInt($('#fGoal').value) || 0); await store.set('settings', settings); renderStats(); });
 $('#btnExport').addEventListener('click', async () => {
-  const data = JSON.stringify({ app: 'mi-biblioteca', version: 1, exported: new Date().toISOString(), settings, books }, null, 1);
+  const data = JSON.stringify({ app: 'mi-biblioteca', version: 1, exported: new Date().toISOString(), settings: { goal: settings.goal }, books }, null, 1);
   const name = `biblioteca-${today()}.json`;
   const file = new File([data], name, { type: 'application/json' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
