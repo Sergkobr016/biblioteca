@@ -1,5 +1,5 @@
 // Guarda la app para que abra sin conexión. Las búsquedas siempre van a internet.
-const CACHE = 'biblioteca-v3';
+const CACHE = 'biblioteca-v4';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-180.png'];
 
 self.addEventListener('install', e => {

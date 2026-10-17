@@ -302,6 +302,7 @@ dialog[open]{display:flex;flex-direction:column}
         <label class="btn" for="fPhoto"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Usar mi foto</label>
         <input type="file" id="fPhoto" accept="image/*" capture="environment" hidden>
         <button type="button" class="btn ghost" id="btnEditBasics">Editar datos del libro</button>
+        <button type="button" class="btn" id="btnFill" hidden>Buscar sinopsis y género</button>
       </div>
     </div>
 
@@ -334,7 +335,7 @@ dialog[open]{display:flex;flex-direction:column}
     <div class="btn-row"><button class="btn" id="btnTest">Probar la búsqueda</button></div>
     <p class="note" id="testOut"></p>
     <p class="note" id="storageInfo"></p>
-    <p class="note">Versión 3 · 17-10-2026</p>
+    <p class="note">Versión 4 · 17-10-2026</p>
   </div>
 </dialog>
 
@@ -472,7 +473,7 @@ function fromGoogle(v) {
     gid: v.id, title: i.title + (i.subtitle ? ': ' + i.subtitle : ''), authors: (i.authors || []).join(', '),
     cover: https(img.extraLarge || img.large || img.medium || img.thumbnail || img.smallThumbnail),
     description: stripHTML(i.description), isbn, pages: i.pageCount || '', year: (i.publishedDate || '').slice(0, 4),
-    publisher: i.publisher || '', genre: (i.categories || [])[0] || '', lang: i.language || '', source: 'Google Books'
+    publisher: i.publisher || '', genre: genreES(i.categories || []), lang: i.language || '', source: 'Google Books'
   };
 }
 const isbnOf = q => { const c = q.replace(/[-\s]/g, ''); return /^(97[89])?\d{9}[\dXx]$/.test(c) ? c : ''; };
@@ -498,7 +499,7 @@ async function searchOpenLibrary(q, isbn) {
       olkey: d.key, title: d.title + (d.subtitle ? ': ' + d.subtitle : ''), authors: (d.author_name || []).slice(0, 3).join(', '),
       cover: olCover(d.cover_i), description: '', isbn: isbns.find(x => /^97[89]84/.test(x)) || isbns.find(x => x.length === 13) || isbns[0] || '',
       pages: d.number_of_pages_median || '', year: d.first_publish_year || '', publisher: (d.publisher || [])[0] || '',
-      genre: '', source: 'Open Library'
+      genre: genreES(d.subject || []), source: 'Open Library'
     };
   });
 }
@@ -525,8 +526,65 @@ async function openLibraryISBN(isbn) {
     };
   } catch { return null; }
 }
+/* ---------- Género en español ---------- */
+const GENRE_MAP = [
+  [/science fiction|ciencia ficci/i, 'Ciencia ficción'], [/fantasy|fantas/i, 'Fantasía'], [/horror|terror/i, 'Terror'],
+  [/thriller|suspense/i, 'Thriller'], [/detective|mystery|crime|noir|policiac|polic[ií]a|misterio|negra/i, 'Novela negra'], [/romance|rom[aá]ntic/i, 'Romántica'],
+  [/historical fiction|novela hist/i, 'Novela histórica'], [/juvenile|young adult|juvenil/i, 'Juvenil'], [/children|infantil/i, 'Infantil'],
+  [/comic|graphic novel|c[oó]mic/i, 'Cómic'], [/poetry|poes/i, 'Poesía'], [/drama|teatro/i, 'Teatro'], [/humor/i, 'Humor'],
+  [/biograph|memoir|autobiograf|memorias/i, 'Biografía'], [/self-help|autoayuda|personal development|desarrollo personal/i, 'Autoayuda'],
+  [/business|economics|management|empresa|econom/i, 'Empresa y economía'], [/psycholog|psicolog/i, 'Psicología'],
+  [/philosoph|filosof/i, 'Filosofía'], [/history|historia/i, 'Historia'], [/politic/i, 'Política'], [/religion|religi/i, 'Religión'],
+  [/health|fitness|salud/i, 'Salud'], [/cooking|cocina/i, 'Cocina'], [/travel|viaje/i, 'Viajes'], [/computer|inform[aá]tica|programming/i, 'Informática'],
+  [/engineering|technology|ingenier|tecnolog/i, 'Tecnología e ingeniería'], [/mathemat|matem/i, 'Matemáticas'], [/science|ciencia/i, 'Ciencia'],
+  [/education|educaci/i, 'Educación'], [/sports|deporte/i, 'Deporte'], [/art\b|arte/i, 'Arte'], [/music|m[uú]sica/i, 'Música'],
+  [/literary criticism|ensayo|essay/i, 'Ensayo'], [/fiction|novel|ficci|novela|narrativa/i, 'Novela']
+];
+function genreES(list) {
+  // Busca la etiqueta más concreta: «Fiction / Fantasy / Epic» → Fantasía
+  const items = (Array.isArray(list) ? list : [list]).filter(Boolean).flatMap(x => String(x).split(/\s*[\/,]\s*/).reverse());
+  for (const [re, label] of GENRE_MAP) if (label !== 'Novela' && items.some(x => re.test(x))) return label;
+  return items.some(x => GENRE_MAP.at(-1)[0].test(x)) ? 'Novela' : '';
+}
+const cap = t => t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+
+/* ---------- Wikipedia y Wikidata (sinopsis y género en español) ---------- */
+const WP = 'https://es.wikipedia.org/w/api.php';
+async function wikipediaBook(b) {
+  const main = b.title.split(/[:(.]/)[0].trim();
+  const surname = (b.authors || '').split(',')[0].trim().split(' ').pop() || '';
+  const params = `action=query&format=json&origin=*&generator=search&gsrlimit=6&gsrsearch=${encodeURIComponent(main + ' ' + surname)}&prop=extracts|pageprops&exintro=1&explaintext=1&exlimit=6&ppprop=wikibase_item|disambiguation&redirects=1`;
+  const r = await fetch(`${WP}?${params}`);
+  if (!r.ok) return null;
+  const pages = Object.values((await r.json()).query?.pages || {}).sort((a, z) => a.index - z.index);
+  const nt = norm(main);
+  const page = pages.find(p => {
+    if (!p.extract || (p.pageprops && 'disambiguation' in p.pageprops)) return false;
+    const pt = norm(p.title.replace(/\s*\(.*\)$/, ''));
+    const about = norm(p.extract.slice(0, 400));
+    const isWork = /novela|libro|obra|ensayo|saga|relato|cuento|poemario|trilog|publicad|escrit/.test(about);
+    return (pt === nt || pt.startsWith(nt) || nt.startsWith(pt)) && isWork && (!surname || about.includes(norm(surname)) || pt === nt);
+  });
+  if (!page) return null;
+  return { description: page.extract.trim(), wikidata: page.pageprops?.wikibase_item || '', url: `https://es.wikipedia.org/wiki/${encodeURIComponent(page.title)}` };
+}
+async function wikidataGenre(qid) {
+  const WD = 'https://www.wikidata.org/w/api.php?format=json&origin=*&action=wbgetentities';
+  const r = await fetch(`${WD}&ids=${qid}&props=claims`);
+  const claims = (await r.json()).entities?.[qid]?.claims?.P136 || [];
+  const ids = claims.map(c => c.mainsnak?.datavalue?.value?.id).filter(Boolean).slice(0, 6);
+  if (!ids.length) return '';
+  const r2 = await fetch(`${WD}&ids=${ids.join('|')}&props=labels&languages=es`);
+  const ents = (await r2.json()).entities || {};
+  const labels = ids.map(id => ents[id]?.labels?.es?.value).filter(Boolean);
+  const generic = /^(novela|libro|obra literaria|literatura|ficci[oó]n|prosa|narrativa)$/i;
+  const best = labels.find(l => !generic.test(l)) || labels[0] || '';
+  return cap(best);
+}
+
 async function enrich(b) {
-  // Ficha completa: portada más grande y sinopsis entera
+  const tasks = [];
+  // 1. Ficha completa de Google: portada grande, sinopsis, categoría
   if (b.gid) {
     try {
       const key = settings.apiKey ? `?key=${encodeURIComponent(settings.apiKey)}` : '';
@@ -536,18 +594,34 @@ async function enrich(b) {
         for (const k of ['cover', 'description', 'pages', 'publisher', 'genre']) if (full[k] && (!b[k] || (k === 'description' && full[k].length > b[k].length))) b[k] = full[k];
       }
     } catch {}
+  } else if (b.isbn && settings.apiKey) {
+    try { const g = await searchGoogle('', b.isbn); if (g[0]) { for (const k of ['description', 'cover', 'genre', 'gid']) if (!b[k] && g[0][k]) b[k] = g[0][k]; } } catch {}
   }
-  if (!b.description && b.olkey) {
+  // 2. Wikipedia en español: sinopsis si falta, y género desde Wikidata
+  let wp = null;
+  try { wp = await wikipediaBook(b); } catch {}
+  if (wp) {
+    if (!b.description || b.description.length < 120) { b.description = wp.description; b.descSource = 'Wikipedia'; }
+    if (wp.wikidata) { try { const g = await wikidataGenre(wp.wikidata); if (g) { b.genre = g; b.genreES = true; } } catch {} }
+  }
+  // 3. Open Library: sinopsis (a menudo en inglés) y temas
+  if (b.olkey && (!b.description || !b.genre)) {
     try {
       const r = await fetch(`${OL}${b.olkey}.json`);
-      if (r.ok) { const w = await r.json(); const d = typeof w.description === 'string' ? w.description : (w.description && w.description.value) || ''; b.description = d.replace(/\r/g, '').trim(); if (!b.genre && w.subjects) b.genre = w.subjects[0]; }
+      if (r.ok) {
+        const w = await r.json();
+        const d = typeof w.description === 'string' ? w.description : (w.description && w.description.value) || '';
+        if (!b.description && d) { b.description = d.replace(/\r/g, '').replace(/\(\[source\].*$/s, '').trim(); b.descSource = 'Open Library'; }
+        if (!b.genre && w.subjects) b.genre = genreES(w.subjects);
+      }
     } catch {}
   }
-  if (!b.description && b.isbn && !b.gid) {
-    // Último intento: sinopsis en Google por ISBN
-    try { const g = await searchGoogle('', b.isbn); if (g[0]) { b.description = g[0].description; if (!b.cover) b.cover = g[0].cover; b.gid = g[0].gid; } } catch {}
+  // 4. El género siempre en español
+  if (b.genre && !b.genreES && !/[áéíóúñ]|^(Thriller|Humor|Novela|Teatro|Arte|Historia|Juvenil|Infantil|Política|Salud|Cocina|Viajes|Deporte|Filosofía|Psicología|Poesía|Fantasía|Terror|Cómic|Ensayo|Ciencia)$/i.test(b.genre)) {
+    b.genre = genreES(b.genre) || b.genre;
   }
   if (!b.cover && b.isbn) b.cover = `https://covers.openlibrary.org/b/isbn/${b.isbn}-L.jpg?default=false`;
+  delete b.genreES;
   return b;
 }
 
@@ -793,7 +867,8 @@ function paintView(b) {
   d.style.whiteSpace = 'pre-line';
   d.classList.add('clamp');
   requestAnimationFrame(() => { $('#btnMore').hidden = d.scrollHeight <= d.clientHeight + 2; });
-  $('#bSrc').textContent = b.source ? 'Datos de ' + b.source : '';
+  $('#bSrc').textContent = [b.source ? 'Datos de ' + b.source : '', b.descSource && b.descSource !== b.source ? 'sinopsis de ' + b.descSource : ''].filter(Boolean).join(' · ');
+  $('#btnFill').hidden = isNew || (!!b.description && !!b.genre);
 }
 function openBook(b, newBook = false, manual = false) {
   editing = b; isNew = newBook; pendingPhoto = null; $('#suggest').innerHTML = '';
@@ -818,6 +893,18 @@ function openBook(b, newBook = false, manual = false) {
   if (manual) setTimeout(() => $('#fTitle').focus(), 50);
 }
 $('#btnMore').addEventListener('click', () => { $('#bDesc').classList.remove('clamp'); $('#btnMore').hidden = true; });
+$('#btnFill').addEventListener('click', async () => {
+  const btn = $('#btnFill'); btn.disabled = true; btn.textContent = 'Buscando…';
+  const b = { ...editing };
+  await enrich(b);
+  btn.disabled = false; btn.textContent = 'Buscar sinopsis y género';
+  let got = [];
+  if (b.description && !editing.description) { editing.description = b.description; editing.descSource = b.descSource; $('#fDesc').value = b.description; got.push('sinopsis'); }
+  if (b.genre && !editing.genre) { editing.genre = b.genre; $('#fGenre').value = b.genre; got.push('género'); }
+  if (b.cover && !editing.cover) editing.cover = b.cover;
+  if (got.length) { await save(); paintView(editing); renderShelf(); toast('Añadido: ' + got.join(' y ')); }
+  else toast('No he encontrado más datos de este libro. Puedes escribirlos con «Editar datos del libro».');
+});
 $('#btnEditBasics').addEventListener('click', () => { $('#editBasics').hidden = false; $('#descBlock').hidden = true; $('#fTitle').focus(); });
 
 $('#fPhoto').addEventListener('change', async e => {
